@@ -54,8 +54,8 @@ class WaveletDWT(object):
 
     def dwt2(self, img: torch.Tensor):
         """
-        img: [B, 3, H, W] single frame
-        return LL, LH, HL, HH: each [B, 3, H//2, W//2]
+        img: [B,3,H,W] single frame
+        return LL, LH, HL, HH: each [B,3,H//2, W//2]
         """
         B, C, H, W = img.shape
         ll_list, lh_list, hl_list, hh_list = [], [], [], []
@@ -89,13 +89,14 @@ class WaveletDWT(object):
         return torch.stack(rec_imgs)
 
 
-# ========================= FAGDM: Frequency‑Domain Attention‑Guided Dynamic Masking =========================
-def FAGDM(attention, b, T, epoch, total_epochs, alpha_exp=0.6, p_high=0.90, p_low=0.40):
+# ====================== FAGDM Frequency‑Domain Attention‑Guided Dynamic Masking ======================
+def FAGDM(attention, b, T, patch_size, epoch, total_epochs, alpha_exp=0.6, p_high=0.90, p_low=0.40):
     """
     Paper formula (21)(22)(23) Bernoulli probability sampling
     :param attention: cls_attention [B, T, 196]
     :param b: batch_size_per_gpu
     :param T: frames per sample
+    :param patch_size: model patch size
     :param epoch: current epoch
     :param total_epochs: total training epoch
     :param alpha_exp: initial threshold coefficient 0.6
@@ -110,37 +111,39 @@ def FAGDM(attention, b, T, epoch, total_epochs, alpha_exp=0.6, p_high=0.90, p_lo
 
     mask_prob = torch.where(
         above_gamma,
-        torch.full_like(attention, p_high),
-        torch.full_like(attention, p_low)
+        torch.full_like(attention, p_high, device=attention.device),
+        torch.full_like(attention, p_low, device=attention.device)
     )
     mask_sample = torch.bernoulli(mask_prob).detach()
     mask_attn = mask_sample.unsqueeze(1).expand(-1, T, -1).reshape(b * T, -1)
-    mask = mask_attn.reshape(-1, 14, 14)
+    num_spatial = 224 // patch_size
+    mask = mask_attn.reshape(-1, num_spatial, num_spatial)
     return mask.bool()
 
 
-# ========================= RTM Random Tube Masking =========================
-def RTM_mask(batch_bt, num_patch_spatial=14, rho_l=0.90):
+# ====================== RTM Random Tube Masking ======================
+def RTM_mask(batch_bt, num_patch_spatial=14, rho_l=0.90, device="cuda"):
     """
     Sample spatial mask and replicate over all time steps.
     :param batch_bt: BT dimension
     :param num_patch_spatial:14 for 224/16
     :param rho_l: local view mask probability
+    :param device: tensor device
     :return tube_mask [BT,14,14], True=masked
     """
-    space_mask = torch.bernoulli(torch.full((batch_bt, num_patch_spatial, num_patch_spatial), rho_l))
+    space_mask = torch.bernoulli(torch.full((batch_bt, num_patch_spatial, num_patch_spatial), rho_l, device=device))
     return space_mask.bool()
 
 
-# ========================= Subband Reconstruction Loss: Global‑Context‑Conditioned =========================
+# ====================== SubbandReconLoss ======================
 class SubbandReconLoss(nn.Module):
-    def __init__(self, embed_dim=768, lambda_LL=1.0, lambda_LH=1.0, lambda_HL=1.0, lambda_HH=1.0):
+    def __init__(self, embed_dim=768, spatial_hw=112, lambda_LL=1.0, lambda_LH=1.0, lambda_HL=1.0, lambda_HH=1.0):
         super().__init__()
         self.proj_global_context = nn.Linear(embed_dim, embed_dim)
         self.lambdas = {"LL": lambda_LL, "LH": lambda_LH, "HL": lambda_HL, "HH": lambda_HH}
+        self.spatial_hw = spatial_hw
         self.out_ch = 3
-        self.out_hw = 112 // 2
-        total_elem = 4 * self.out_ch * self.out_hw * self.out_hw
+        total_elem = 4 * self.out_ch * self.spatial_hw * self.spatial_hw
         self.wave_decoder = nn.Sequential(
             nn.Linear(embed_dim, embed_dim * 2),
             nn.GELU(),
@@ -164,7 +167,7 @@ class SubbandReconLoss(nn.Module):
         # formula (28): predict four wavelet subbands
         pred_all = self.wave_decoder(z_local_cond)
         B = pred_all.shape[0]
-        pred_all = pred_all.reshape(B, 4, self.out_ch, self.out_hw, self.out_hw)
+        pred_all = pred_all.reshape(B, 4, self.out_ch, self.spatial_hw, self.spatial_hw)
         pred = {
             "LL": pred_all[:, 0],
             "LH": pred_all[:, 1],
@@ -255,7 +258,7 @@ def get_args_parser():
     parser.add_argument('--local_crops_scale', type=float, nargs='+', default=(0.05, 0.4), help="""Scale range of the 
     cropped image before resizing, relatively to the origin image. Used for small local view cropping of 
     multi‑crop.""")
-    # wavelet viz
+    #wt
     parser.add_argument('--enable_wavelet_viz', action='store_true',
                         help='Enable wavelet visualization')
     parser.add_argument('--wt_max_samples', default=10, type=int,
@@ -306,6 +309,7 @@ def train_svt(args):
     alpha_l = args.alpha_l
     loss_rec_weight = args.loss_rec_weight
     global_crops_number = args.global_crops_number
+    patch_size = args.patch_size
 
     config = load_config(args)
     if utils.is_main_process():
@@ -337,7 +341,7 @@ def train_svt(args):
         rand_conv = None
 
     dwt_tool = WaveletDWT(wavelet="db1", device="cuda")
-    recon_criterion = SubbandReconLoss(embed_dim=768).cuda()
+    recon_criterion = SubbandReconLoss(embed_dim=768, spatial_hw=112).cuda()
 
     args.arch = args.arch.replace("deit", "vit")
     student = None
@@ -536,7 +540,7 @@ def train_svt(args):
             dataset.set_epoch(epoch)
         train_stats = train_one_epoch(
             student, teacher, teacher_without_ddp, dino_loss,
-            data_loader, alpha_exp, p_high, p_low, rho_l, alpha_g, alpha_l, loss_rec_weight,
+            data_loader, alpha_exp, p_high, p_low, rho_l, alpha_g, alpha_l, loss_rec_weight, patch_size,
             optimizer, lr_schedule, wd_schedule, momentum_schedule,
             epoch, fp16_scaler, args, cfg=config, dwt_tool=dwt_tool, recon_criterion=recon_criterion,
             motion_loss=dino_flow_loss, cross_loss=dino_cross_loss,
@@ -581,7 +585,7 @@ def train_svt(args):
 
 
 def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loader,
-                    alpha_exp, p_high, p_low, rho_l, alpha_g, alpha_l, loss_rec_weight,
+                    alpha_exp, p_high, p_low, rho_l, alpha_g, alpha_l, loss_rec_weight, patch_size,
                     optimizer, lr_schedule, wd_schedule, momentum_schedule, epoch,
                     fp16_scaler, args, cfg=None, dwt_tool=None, recon_criterion=None,
                     motion_teacher=None, motion_student=None,
@@ -598,6 +602,21 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
             if i == 0:
                 param_group["weight_decay"] = wd_schedule[it]
         images = [im.cuda(non_blocking=True) for im in images]
+
+        loss_rec = torch.tensor(0.0, device="cuda")
+        gt_subbands = None
+
+        # wavelet transform outside autocast (pywt uses numpy cpu)
+        if not (cfg.MODEL.TWO_STREAM or cfg.MODEL.TWO_TOKEN):
+            B, C, T, H, W = images[0].shape
+            first_frame_g = images[0][:, :, 0, :, :]
+            LL, LH, HL, HH = dwt_tool.dwt2(first_frame_g)
+            gt_subbands = {
+                "LL": LL * alpha_g,
+                "LH": LH * alpha_l,
+                "HL": HL * alpha_l,
+                "HH": HH * alpha_l
+            }
 
         with torch.cuda.amp.autocast(fp16_scaler is not None):
             if cfg.MODEL.TWO_STREAM:
@@ -622,7 +641,7 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
                     Tg = teacher_attentions[u].size(0) // b_per_gpu
                     attn = teacher_attentions[u]
                     cls_attn = attn[:, :, 0, 1:].mean(1).reshape(b_per_gpu, Tg, 196).detach()
-                    mask_fagdm = FAGDM(cls_attn, b_per_gpu, Tg, epoch, args.epochs,
+                    mask_fagdm = FAGDM(cls_attn, b_per_gpu, Tg, patch_size, epoch, args.epochs,
                                        alpha_exp=alpha_exp, p_high=p_high, p_low=p_low)
                     masks_attn_list.append(mask_fagdm)
 
@@ -630,29 +649,22 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
                 masks_local = []
                 for view in local_views:
                     bt = view.shape[0] * view.shape[2]
-                    m_rtm = RTM_mask(bt, num_patch_spatial=14, rho_l=rho_l)
+                    m_rtm = RTM_mask(bt, num_patch_spatial=14, rho_l=rho_l, device="cuda")
                     masks_local.append(m_rtm)
 
                 if it % int(args.save_mask_num) == 0:
                     save_mask_visualization(images, masks_attn_list, epoch, it, save_dir=mask_viz_dir)
 
-                feat_global_masked = student(images[:2], masks_attn_list, return_features=True)
-                feat_local_masked = student(images[2:], masks_local, return_features=True)
+                # fix argument order bug: keyword arguments explicitly pass
+                feat_global_masked = student(images[:2], masks=masks_attn_list, return_features=True)
+                feat_local_masked = student(images[2:], masks=masks_local, return_features=True)
                 student_full_out = student(images, masks=None)
                 loss_cl = dino_loss(student_full_out, teacher_output, epoch)
 
-                # Wavelet subband prepare: use first global view, sample first batch element, first time‑frame
-                B, C, T, H, W = images[0].shape
-                frame_g = images[0][:, :, 0, :, :]
-                LL, LH, HL, HH = dwt_tool.dwt2(frame_g)
-                gt_subbands = {
-                    "LL": LL * alpha_g,
-                    "LH": LH * alpha_l,
-                    "HL": HL * alpha_l,
-                    "HH": HH * alpha_l
-                }
-                loss_rec = recon_criterion(z_global=feat_global_masked[0], z_local=feat_local_masked[0],
-                                           gt_subbands_dict=gt_subbands)
+                # feat_global_masked is list, take first view feature
+                z_g = feat_global_masked[0]
+                z_l = feat_local_masked[0]
+                loss_rec = recon_criterion(z_global=z_g, z_local=z_l, gt_subbands_dict=gt_subbands)
                 loss_total = loss_cl + loss_rec_weight * loss_rec
 
         if not math.isfinite(loss_total.item()):
@@ -687,7 +699,7 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
         torch.cuda.synchronize()
         metric_logger.update(loss=loss_total.item())
         metric_logger.update(loss_cl=loss_cl.item())
-        if 'loss_rec' in locals():
+        if not (cfg.MODEL.TWO_STREAM or cfg.MODEL.TWO_TOKEN):
             metric_logger.update(loss_rec=loss_rec.item())
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
         metric_logger.update(wd=optimizer.param_groups[0]["weight_decay"])
