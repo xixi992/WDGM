@@ -1,11 +1,11 @@
 # Copyright (c) Facebook, Inc. and its affiliates.
-# 
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
-# 
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-# 
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -24,6 +24,8 @@ import math
 import random
 import datetime
 import subprocess
+import argparse
+import warnings
 from collections import defaultdict, deque
 
 import numpy as np
@@ -569,6 +571,8 @@ class MultiCropWrapper(nn.Module):
     forward passes = number of different resolutions used. We then
     concatenate all the output features and run the head forward on these
     concatenated features.
+
+    新增参数 return_features: True 只返回backbone原始特征，不经过Projection Head，用于MIM重建损失
     """
     def __init__(self, backbone, head, vary_fr=False):
         super(MultiCropWrapper, self).__init__()
@@ -579,40 +583,43 @@ class MultiCropWrapper(nn.Module):
         self.head = head
         self.vary_fr = vary_fr
 
-    def forward(self, x, masks=None, return_attention=False, **kwargs):
+    def forward(self, x, masks=None, return_attention=False, return_features=False, **kwargs):
         # convert to list
         if not isinstance(x, list):
             x = [x]
         idx_crops = torch.cumsum(torch.unique_consecutive(
-            torch.tensor([inp.shape[-1] for inp in x]),  # [224,224,96,96,96,96,96,96,96,96]
+            torch.tensor([inp.shape[-1] for inp in x]),
             return_counts=True,
-        )[1], 0)  # [2,10]
-        if self.vary_fr:  # True
-            if len(x) == 10:  # global and local views
+        )[1], 0)
+        if self.vary_fr:
+            if len(x) == 10:
                 idx_crops = [1, 2, 4, 6, 8, 10]
-            elif len(x) == 8:  # local views
+            elif len(x) == 8:
                 idx_crops = [2, 4, 6, 8]
-            elif len(x) == 2:  # globa views
+            elif len(x) == 2:
                 idx_crops = [1, 2]
-        # -------
+
+        # ========= mask分支：逐view送入backbone，带上mask =========
         if masks is not None:
-            loss = 0
-            start_1 = 0
-            if len(masks) == 8:
-                idx_m = [2, 4, 6, 8]
-            elif len(masks) == 2:
-                idx_m = [1, 2]
-            for end_1 in idx_m:
-                _out_vis_loss, _ = self.backbone(torch.cat(x[start_1: end_1]), torch.cat(masks[start_1: end_1]), **kwargs)
-                loss += _out_vis_loss
-                start_1 = end_1
-            return loss
-        # -------
+            feats_out = []
+            start_idx = 0
+            for end_idx in idx_crops:
+                x_batch = torch.cat(x[start_idx: end_idx])
+                m_batch = torch.cat(masks[start_idx: end_idx])
+                feat = self.backbone(x_batch, mask=m_batch, **kwargs)
+                feats_out.append(feat)
+                start_idx = end_idx
+            if return_features:
+                return feats_out
+            out_cat = torch.cat(feats_out)
+            return self.head(out_cat)
+
+        # ========= return attention分支（teacher获取注意力图） =========
         if return_attention:
             start_idx = 0
             attention = []
             for end_idx in idx_crops:
-                _out, _att = self.backbone(torch.cat(x[start_idx: end_idx]), get_attn=True, **kwargs)
+                _out, _att = self.backbone(torch.cat(x[start_idx: end_idx]), get_attn=True,** kwargs)
                 attention.append(_att)
                 if start_idx == 0:
                     output = _out
@@ -621,12 +628,14 @@ class MultiCropWrapper(nn.Module):
                         output1 = torch.cat((output[0], _out[0]))
                         output2 = torch.cat((output[1], _out[1]))
                         output = (output1, output2)
-                    else:  # Here
+                    else:
                         output = torch.cat((output, _out))
                 start_idx = end_idx
-            # Run the head forward on the concatenated features.
+            if return_features:
+                return output, attention
             return self.head(output), attention
 
+        # ========= 普通前向 / return_features模式（只取backbone输出，不走head） =========
         start_idx = 0
         for end_idx in idx_crops:
             _out = self.backbone(torch.cat(x[start_idx: end_idx]), **kwargs)
@@ -637,10 +646,12 @@ class MultiCropWrapper(nn.Module):
                     output1 = torch.cat((output[0], _out[0]))
                     output2 = torch.cat((output[1], _out[1]))
                     output = (output1, output2)
-                else:  # Here
+                else:
                     output = torch.cat((output, _out))
             start_idx = end_idx
-        # Run the head forward on the concatenated features.
+
+        if return_features:
+            return output
         return self.head(output)
 
 
